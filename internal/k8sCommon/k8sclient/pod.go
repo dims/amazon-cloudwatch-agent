@@ -4,92 +4,68 @@
 package k8sclient
 
 import (
-	"context"
-	"errors"
-	"fmt"
 	"log"
 	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 )
 
 type PodClient interface {
 	NamespaceToRunningPodNum() map[string]int
-
-	Init()
+	Init(client kubernetes.Interface)
 	Shutdown()
 }
 
 type podClient struct {
 	sync.RWMutex
 
-	stopChan chan struct{}
-	store    *ObjStore
+	stopChan        chan struct{}
+	informerFactory informers.SharedInformerFactory
+	podInformer     cache.SharedIndexInformer
+	queue           workqueue.RateLimitingInterface
 
-	inited bool
-
+	inited                      bool
 	namespaceToRunningPodNumMap map[string]int
 }
 
 func (c *podClient) NamespaceToRunningPodNum() map[string]int {
-	if !c.inited {
-		c.Init()
-	}
-	//if c.store.Refreshed() {
-	//	log.Printf("I! store refresh %v", c.store.refreshed)
-	//	c.refresh()
-	//}
-	c.refresh()
 	c.RLock()
 	defer c.RUnlock()
 	return c.namespaceToRunningPodNumMap
 }
 
-func (c *podClient) refresh() {
-	c.Lock()
-	defer c.Unlock()
-
-	objsList := c.store.List()
-	namespaceToRunningPodNumMapNew := make(map[string]int)
-	for _, obj := range objsList {
-		pod := obj.(*podInfo)
-		if pod.phase == v1.PodRunning {
-			if podNum, ok := namespaceToRunningPodNumMapNew[pod.namespace]; !ok {
-				namespaceToRunningPodNumMapNew[pod.namespace] = 1
-			} else {
-				namespaceToRunningPodNumMapNew[pod.namespace] = podNum + 1
-			}
-		}
-	}
-	c.namespaceToRunningPodNumMap = namespaceToRunningPodNumMapNew
-}
-
-func (c *podClient) Init() {
+func (c *podClient) Init(client kubernetes.Interface) {
 	c.Lock()
 	defer c.Unlock()
 	if c.inited {
 		return
 	}
 
+	c.namespaceToRunningPodNumMap = make(map[string]int)
 	c.stopChan = make(chan struct{})
+	c.informerFactory = informers.NewSharedInformerFactory(client, 10*time.Minute)
+	c.podInformer = c.informerFactory.Core().V1().Pods().Informer()
+	c.queue = workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
-	c.store = NewObjStore(transformFuncPod)
+	_, err := c.podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.handlePodAdd,
+		UpdateFunc: c.handlePodUpdate,
+		DeleteFunc: c.handlePodDelete,
+	})
+	if err != nil {
+		log.Printf("W! Pod unable to add event handler: %v", err)
+		return
+	}
 
-	lw := createPodListWatch(Get().ClientSet, metav1.NamespaceAll)
-	reflector := cache.NewReflector(lw, &v1.Pod{}, c.store, 0)
-	go reflector.Run(c.stopChan)
+	go c.informerFactory.Start(c.stopChan)
 
-	if err := wait.Poll(50*time.Millisecond, 2*time.Second, func() (done bool, err error) {
-		return reflector.LastSyncResourceVersion() != "", nil
-	}); err != nil {
-		log.Printf("W! Pod initial sync timeout: %v", err)
+	if !cache.WaitForCacheSync(c.stopChan, c.podInformer.HasSynced) {
+		log.Printf("W! Pod initial sync timeout")
 	}
 
 	c.inited = true
@@ -103,32 +79,35 @@ func (c *podClient) Shutdown() {
 	}
 
 	close(c.stopChan)
+	c.queue.ShutDown()
 
 	c.inited = false
 }
 
-func transformFuncPod(obj interface{}) (interface{}, error) {
-	pod, ok := obj.(*v1.Pod)
-	if !ok {
-		return nil, errors.New(fmt.Sprintf("input obj %v is not Pod type", obj))
-	}
-	info := new(podInfo)
-	info.namespace = pod.Namespace
-	info.phase = pod.Status.Phase
-	return info, nil
+func (c *podClient) handlePodAdd(obj interface{}) {
+	c.updatePodCount(obj.(*v1.Pod), 1)
 }
 
-func createPodListWatch(client kubernetes.Interface, ns string) cache.ListerWatcher {
-	ctx := context.Background()
-	return &cache.ListWatch{
-		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
-			opts.ResourceVersion = ""
-			// Passing empty context as this was not required by old List()
-			return client.CoreV1().Pods(ns).List(ctx, opts)
-		},
-		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
-			// Passing empty context as this was not required by old Watch()
-			return client.CoreV1().Pods(ns).Watch(ctx, opts)
-		},
+func (c *podClient) handlePodUpdate(oldObj, newObj interface{}) {
+	oldPod := oldObj.(*v1.Pod)
+	newPod := newObj.(*v1.Pod)
+
+	if oldPod.Status.Phase != v1.PodRunning && newPod.Status.Phase == v1.PodRunning {
+		c.updatePodCount(newPod, 1)
+	} else if oldPod.Status.Phase == v1.PodRunning && newPod.Status.Phase != v1.PodRunning {
+		c.updatePodCount(newPod, -1)
+	}
+}
+
+func (c *podClient) handlePodDelete(obj interface{}) {
+	c.updatePodCount(obj.(*v1.Pod), -1)
+}
+
+func (c *podClient) updatePodCount(pod *v1.Pod, delta int) {
+	if pod.Status.Phase == v1.PodRunning {
+		c.namespaceToRunningPodNumMap[pod.Namespace] += delta
+		if c.namespaceToRunningPodNumMap[pod.Namespace] <= 0 {
+			delete(c.namespaceToRunningPodNumMap, pod.Namespace)
+		}
 	}
 }
